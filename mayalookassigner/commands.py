@@ -13,43 +13,53 @@ from avalon import io, api
 log = logging.getLogger(__name__)
 
 
+def get_workfile():
+    path = cmds.file(query=True, sceneName=True)
+    return os.path.basename(path)
+
+
 def get_workfolder():
     return os.path.dirname(cmds.file(query=True, sceneName=True))
 
 
-def get_selected_assets():
-    """Get information from current selection"""
+def select(nodes):
+    cmds.select(nodes)
 
-    # TODO: Investigate how we can make `long` argument work
+
+def get_namespace_from_node(node):
+    """Get the namespace from the given node
+
+    Args:
+        node (str): name of the node
+
+    Returns:
+        namespace (str)
+
+    """
+    _, ns = cmds.ls(node, showNamespace=True)
+    return ns
+
+
+def get_items_from_selection():
+    """Get information from current selection"""
 
     items = []
     selection = cmds.ls(selection=True)
+    hierarchy = cmds.listRelatives(selection,
+                                   allDescendents=True,
+                                   fullPath=True) or selection
 
-    containers = get_containers(selection)
-    if not containers:
-        hierarchy = cmds.listRelatives(selection, allDescendents=True) or []
-        containers = get_containers(hierarchy)
-        if not containers:
-            log.info("No items selected with loaded content")
-            return items
-
-    for container, content in containers.iteritems():
-        # Ensure we have all
-        # Create an item for the tool
-        item = create_item_from_container(container, content)
-        if not item:
-            continue
-
-        items.append(item)
+    view_items = create_items_from_selection(hierarchy)
+    items.extend(view_items)
 
     return items
 
 
 def get_all_assets():
-    """Get all assets from the scene
+    """Get all assets from the scene, container based
 
     Returns:
-        list
+        list: list of dictionaries
     """
 
     host = api.registered_host()
@@ -62,11 +72,11 @@ def get_all_assets():
         # Gather all information
         container_name = container["objectName"]
         content = cmds.sets(container_name, query=True)
-        item = create_item_from_container(container_name, content)
-        if not item:
+        view_items = create_items_from_selection(content)
+        if not view_items:
             continue
 
-        items.append(item)
+        items.extend(view_items)
 
     return items
 
@@ -129,72 +139,77 @@ def create_asset_id_hash(nodes):
         asset_id = value.split(":")[0]
         node_id_hash[asset_id].append(node)
 
-    return node_id_hash
+    return dict(node_id_hash)
 
 
-def create_item_from_container(objectname, content):
+def create_items_from_selection(content):
     """Create an item for the view based the container and content of it
 
     It fetches the look document based on the asset ID found in the content.
     The item will contain all important information for the tool to work.
 
+    If there is an asset ID which is not registered in the project's collection
+    it will log a warning message.
+
     Args:
-        objectname(str): name of the objectSet (container)
-        content (list): list of items which are in the
+        content (list): list of items which are in the container or selection
+
+    Returns:
+        list of dicts
+
     """
 
-    id_hash = create_asset_id_hash(content)
-    topnode = cblib.get_container_transforms({"objectName": objectname},
-                                             members=content,
-                                             root=True)
+    asset_view_items = []
 
-    try:
-        _id = id_hash.keys()[0]
-    except IndexError:
-        return {}
+    id_hashes = create_asset_id_hash(content)
+    if not id_hashes:
+        return asset_view_items
 
-    asset = io.find_one({"_id": io.ObjectId(_id)}, projection={"name": True})
-    looks = fetch_looks([_id])
+    for _id, nodes in id_hashes.items():
+        document = io.find_one({"_id": io.ObjectId(_id)},
+                                projection={"name": True})
 
-    return {"asset": asset,
-            "objectName": topnode,
-            "looks": looks,
-            "_id": _id}
+        # Skip if asset id is not found
+        if not document:
+            log.warning("Id not found in the database, skipping '%s'." % _id)
+            log.warning("Nodes: %s" % nodes)
+            continue
+
+        looks = fetch_looks(document)
+        namespace = get_namespace_from_node(nodes[0])
+        asset = "%s : %s" % (namespace, document["name"])
+        asset_view_items.append({"asset": asset,
+                                 "asset_name": document["name"],
+                                 "document": document,
+                                 "looks": looks,
+                                 "_id": _id,
+                                 "nodes": nodes})
+    return asset_view_items
 
 
-def fetch_looks(asset_ids):
-    """Get all looks based on the asset id from the cbId attributes
-
-    Use the given asset ID from the attribute which matches an ID from the
-    database to use
+def fetch_looks(document):
+    """Get all looks based on the asset id
 
     Args:
-        asset_ids (list): list of unique asset IDs
+        document (dict): database object
 
     Returns:
         looks (list): looks per asset {asset_name : [look_data, look_data]}
     """
 
-    publish_looks = list()
-    for asset_id in asset_ids:
-        # Get asset name for sorting
-        object_id = io.ObjectId(asset_id)
+    publish_looks = []
 
-        # Verify if asset ID is correct
-        asset = io.find_one({"_id": object_id}, projection={"name": True})
-        if not asset:
-            raise ValueError("Could not find asset with objectId "
-                             "`{}`".format(asset_id))
+    # Get all data
+    asset_name = document["name"]
+    for subset in cblib.list_looks(document["_id"]):
+        version = io.find_one({"type": "version",
+                               "parent": subset["_id"]},
+                               projection={"name": True, "parent": True},
+                               sort=[("name", -1)])
 
-        # Get all data
-        for subset in cblib.list_looks(object_id):
-            version = io.find_one({"type": "version", "parent": subset["_id"]},
-                                   projection={"name": True, "parent": True},
-                                   sort=[("name", -1)])
-
-            publish_looks.append({"asset": asset["name"],
-                                  "subset": subset["name"],
-                                  "version": version})
+        publish_looks.append({"asset_name": asset_name,
+                              "subset": subset["name"],
+                              "version": version})
 
     return publish_looks
 
@@ -206,31 +221,30 @@ def process_queued_item(entry):
         entry (dict):
 
     Returns:
+        None
 
     """
+    # Assume content is stored under nodes, fallback to containers
+    nodes = entry.get("nodes", [])
+    assert nodes, ("Could not find any nodes in selection or from "
+                   "any containers")
 
-    asset_name = entry["asset"]
-    version_id = entry["document"]["_id"]
-
-    # Get the container
-    # Check if item is in a container
-    container_lookup = get_containers(asset_name)
-    if not container_lookup:
-        node_name = asset_name.split("|")[-1]
-        container_lookup = get_containers([node_name])
-
-    containers = container_lookup.keys()
-    assert len(containers) == 1, ("Node is found in no or multiple containers,"
-                                  " this is a bug")
-
-    # Get the content of the container
-    container = containers[0]
-    nodes = cmds.ls(cmds.sets(container, query=True), long=True)
-
-    cblib.assign_look_by_version(nodes, version_id)
+    cblib.assign_look_by_version(nodes, entry["version"]["_id"])
 
 
 def get_asset_data(objectId):
+    """
+    Check if objectId is an asset
+
+    If the objectId is a representation if will look retrieve the parenthood
+    and pick the asset from it
+
+    Args:
+        objectId:
+
+    Returns:
+        asset (dict)
+    """
 
     document = io.find_one({"_id": io.ObjectId(objectId)})
     document_type = document["type"]
@@ -239,14 +253,22 @@ def get_asset_data(objectId):
     elif document_type == "asset":
         asset = document
     else:
-        print("Could not fetch enough data")
+        log.warning("Could not fetch enough data")
         return
 
     return asset
 
 
 def create_queue_out_data(queue_items):
-    """Create a json friendly data block"""
+    """Create a JSON friendly block to write out
+
+    Args:
+        queue_items (list): list of dict
+
+    Returns:
+        list: list of dict
+
+    """
 
     items = []
     for item in queue_items:
@@ -260,7 +282,14 @@ def create_queue_out_data(queue_items):
 
 
 def create_queue_in_data(queue_items):
-    """Create a database friendly data block for the tool"""
+    """Create a database friendly data block for the tool
+
+    Args:
+        queue_items (list): list of dict
+
+    Returns:
+        list: list of dict
+    """
     items = []
     for item in queue_items:
         new_item = deepcopy(item)
